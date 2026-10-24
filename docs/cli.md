@@ -315,6 +315,10 @@ Rust hosts use `SocBus::i2s_input(port)` to access `PcmInput`. `push(&[[left, ri
 queues signed 16-bit stereo frames at the firmware's programmed sample rate.
 For mono input, duplicate each sample into both lanes. `push` returns the number
 accepted, up to a queue limit of 65,536 frames; retry the remaining frames later.
+`push_latest(frames, backlog)` is for live input: it first drops the oldest queued
+frames so at most `backlog` remain. Browser microphone packets use it with 8,192
+frames (0.5 s at 16 kHz), so a guest that is booting, has RX stopped or runs below
+real time loses stale audio rather than new audio, and latency stays bounded.
 `clear()` removes queued data and disables the tone. Empty queues read as zero.
 Queued input pauses while RX or its DMA channel is stopped, including during reboot.
 Each 16-bit input sample is the top 16 bits of the guest's sample, low bits zero.

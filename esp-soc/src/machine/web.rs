@@ -2,6 +2,9 @@
 use super::*;
 use crate::web::{frame, json_escape};
 
+/// Queued browser microphone frames kept for the guest: 0.5 s at 16 kHz, two maximum-size packets.
+const WEB_MICROPHONE_BACKLOG: usize = 8192;
+
 /// `[[r,g,b],…]` for the web protocol.
 fn leds_json(leds: &[[u8; 3]]) -> String {
     leds.iter().map(|c| format!("[{},{},{}]", c[0], c[1], c[2])).collect::<Vec<_>>().join(",")
@@ -122,8 +125,10 @@ impl<S: Soc> Machine<S> {
                     continue;
                 }
                 let samples: Vec<_> = b[2..].as_chunks::<2>().0.iter().map(|v| { let s = i16::from_le_bytes(*v); [s, s] }).collect();
-                let accepted = self.bus.i2s_input(b[1] as usize).map_or(0, |input| input.push(&samples));
-                if accepted != samples.len() { w.send_text(r#"{"t":"microphone-error","message":"Microphone input overflow or unavailable I2S port"}"#); }
+                // A live microphone keeps the newest audio: while the guest is not reading (boot,
+                // stopped RX) or runs below real time, stale frames are dropped instead of new ones.
+                let accepted = self.bus.i2s_input(b[1] as usize).map_or(0, |input| input.push_latest(&samples, WEB_MICROPHONE_BACKLOG));
+                if accepted != samples.len() { w.send_text(r#"{"t":"microphone-error","message":"Unavailable I2S port"}"#); }
                 continue;
             }
             // type 3: camera picture from the browser — [3][w u16 le][h u16 le][RGBA...]
