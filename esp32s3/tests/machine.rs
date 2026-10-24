@@ -564,6 +564,10 @@ fn web_microphone_packets_reach_i2s_reject_invalid_input_and_drop_stale_backlog(
     web.push_incoming_bin(vec![5, 1, 0, 0]); m.run(0);
     assert_eq!(m.bus.i2s_input(1).unwrap().queued_frames(), 8192);
     assert!(web.take_outbox().is_empty());
+    // While the emulator lags real time the backlog is kept for the guest to catch up on.
+    m.rt.behind = 1.0;
+    web.push_incoming_bin(vec![5, 1, 0, 0]); m.run(0);
+    assert_eq!(m.bus.i2s_input(1).unwrap().queued_frames(), 8193);
 }
 
 #[test]
