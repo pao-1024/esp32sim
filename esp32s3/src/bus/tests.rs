@@ -5,6 +5,33 @@ const SPI2: u32 = 0x6002_4000;
 const GDMA: u32 = 0x6003_f000;
 const FIRST_DESC: u32 = 0x3fc9_0100;
 
+#[test]
+fn rmt_receives_routed_board_edges_and_raises_idle_interrupt() {
+    use crate::board::{BoardEdge, BoardModel};
+    struct Echo(Vec<BoardEdge>);
+    impl BoardModel for Echo {
+        fn name(&self) -> &'static str { "rx-echo" }
+        fn take_edges(&mut self) -> Vec<BoardEdge> { std::mem::take(&mut self.0) }
+    }
+    let mut bus = SocBus::new(1024, 1024, [0; 6]);
+    // IDF v6.0.1: GPIO9 matrix input, RMT input signal 81, RX channel 4.
+    bus.periph.io_mux.write(4 + 4 * 9, (1 << 12) | (1 << 9));
+    bus.periph.gpio.write(0x154 + 4 * 81, 0x80 | 9);
+    bus.periph.rmt.write(0xc0, 1 << 24);
+    bus.periph.rmt.write(0x30, 80 | (30000 << 8) | (2 << 24));
+    bus.periph.rmt.write(0x34, 1 | 2 | 8);
+    bus.periph.rmt.write(0x78, 1 << 16);
+    bus.periph.rmt.rx_advance(0);
+    bus.board = Box::new(Echo(vec![BoardEdge { cycle: 48000, pin: 9, level: true }, BoardEdge { cycle: 1440000, pin: 9, level: false }]));
+    bus.cycles = 8640000;
+    bus.board_edges = true;
+    bus.drain_routed_board_inputs();
+    assert_eq!(bus.periph.rmt.read(0x800 + 192 * 4), 200 | ((5800 | 0x8000) << 16));
+    assert_eq!(bus.periph.rmt.read(0x60), 194);
+    assert!(bus.periph.rmt.irq());
+    assert!(bus.irq_dirty);
+}
+
 struct ProbeBoard {
     events: Arc<Mutex<Vec<String>>>,
 }

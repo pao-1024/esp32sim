@@ -462,7 +462,8 @@ impl SocBus {
         self.flush_ticks();                                         // registers must show exact time
         // IDF v5.5.4 components/soc/esp32s3/register/soc/gpio_reg.h: GPIO_IN/IN1.
         if self.board_edges && matches!(addr & !3, 0x6000_403c | 0x6000_4040) {
-            self.irq_dirty |= esp_soc::gpio::deliver_board_inputs(&mut *self.board, &mut self.periph.gpio, &mut self.gpio_events, self.cycles);
+            self.board.advance_to(self.cycles);
+            self.drain_routed_board_inputs();
             self.refresh_tick_budget();
         }
         self.periph.read32(addr)
@@ -817,7 +818,7 @@ impl SocBus {
             || p.aes.dma_pending || p.sha.dma_pending
             || p.spi2.has_pending_transfer() || p.spi2.dma_tx_pending.is_some()
             || p.spi3.has_pending_transfer() || p.spi3.dma_tx_pending.is_some()
-            || p.rmt.ch.iter().any(|c| c.running) || !p.rmt.done.is_empty()
+            || p.rmt.ch.iter().any(|c| c.running) || !p.rmt.done.is_empty() || p.rmt.rx_active()
             || !p.gpio.changes.is_empty() || !p.gpio.input_changes.is_empty()
             || p.rtc.ram.read(0x98) & (1 << 31) != 0
             || p.usb.int_ena & (1 << 1) != 0
@@ -866,7 +867,11 @@ impl SocBus {
                 self.irq_dirty = true;
             }
         }
-        if self.board_edges { self.irq_dirty |= esp_soc::gpio::drain_board_inputs(&mut *self.board, &mut self.periph.gpio, &mut self.gpio_events, self.cycles); }
+        if self.board_edges { self.drain_routed_board_inputs(); }
+        else if self.periph.rmt.rx_active() {
+            self.periph.rmt.rx_advance(self.cycles);
+            self.irq_dirty |= self.periph.rmt.irq();
+        }
         self.complete_spi2_dma();
         self.deliver_spi2_transfer();
         self.complete_spi3_dma();

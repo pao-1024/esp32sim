@@ -169,6 +169,24 @@ fn slow_snapshot_client_does_not_hold_emulator_mutex() {
 
 struct StaticRoot(std::path::PathBuf);
 
+#[test]
+fn microphone_and_speaker_bursts_preserve_order_without_dropping() {
+    let web = WebServer::queued();
+    for n in 0..512u16 {
+        let [lo, hi] = n.to_le_bytes();
+        web.push_incoming_bin(vec![5, 1, lo, hi]);
+    }
+    let incoming = web.poll_incoming_bin();
+    assert_eq!(incoming.len(), 512);
+    for (n, packet) in incoming.iter().enumerate() {
+        assert_eq!(u16::from_le_bytes([packet[2], packet[3]]) as usize, n);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let client = Client { tx, peer: None };
+    for n in 0..512u16 { assert!(client.send(n.to_le_bytes().to_vec())); }
+    for n in 0..512u16 { assert_eq!(rx.recv().unwrap(), n.to_le_bytes()); }
+}
+
 impl StaticRoot {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

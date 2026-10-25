@@ -129,6 +129,25 @@ impl Qacc {
 #[inline] fn qlane(w: u32, i: u32) -> (bool, u32, u32) { if w == 8 { (i >= 8, (i % 8) * 20, 20) } else { (i >= 4, (i % 4) * 40, 40) } }
 fn qacc_get(cpu: &Cpu, w: u32, i: u32, signed: bool) -> i64 { let (h, off, lw) = qlane(w, i); let a = Qacc::from(if h { &cpu.qacc_h } else { &cpu.qacc_l }); let v = a.get(off, lw) as i64; if signed { sext(v, lw) } else { v } }
 fn qacc_set(cpu: &mut Cpu, w: u32, i: u32, v: i64) { let (h, off, lw) = qlane(w, i); let arr = if h { &mut cpu.qacc_h } else { &mut cpu.qacc_l }; let mut a = Qacc::from(arr); a.set(off, lw, v as u64); a.store(arr); }
+// Keep both packed accumulator halves local instead of unpacking/storing all five words per lane.
+fn mac_qacc<const W: u32, const SIGNED: bool>(cpu: &mut Cpu, x: u128, y: u128) {
+    let mut halves = [Qacc::from(&cpu.qacc_l), Qacc::from(&cpu.qacc_h)];
+    for k in 0..128 / W {
+        let (high, offset, bits) = qlane(W, k);
+        let half = &mut halves[high as usize];
+        let previous = half.get(offset, bits) as i64;
+        let value = if SIGNED { sext(previous, bits) + lane(x, W, k) * lane(y, W, k) }
+                    else { previous + (lane_u(x, W, k) * lane_u(y, W, k)) as i64 };
+        half.set(offset, bits, if SIGNED { sat(value, bits) } else { usat(value, bits) } as u64);
+    }
+    halves[0].store(&mut cpu.qacc_l);
+    halves[1].store(&mut cpu.qacc_h);
+}
+fn mac_scalar_qacc<const W: u32>(cpu: &mut Cpu, x: u128, scalar: i64) {
+    let mask = (1u128 << W) - 1;
+    let repeated = (scalar as u128 & mask) * (u128::MAX / mask);
+    mac_qacc::<W, true>(cpu, x, repeated);
+}
 fn accx_get(cpu: &Cpu) -> i64 { sext(cpu.accx[0] as i64 | (((cpu.accx[1] & 0xff) as i64) << 32), 40) }
 fn accx_set(cpu: &mut Cpu, v: i64) { cpu.accx[0] = v as u32; cpu.accx[1] = ((v >> 32) & 0xff) as u32; }
 fn src(qs0: u128, qs1: u128, sh_bytes: u32) -> u128 { let sh = (sh_bytes & 0xf) * 8; if sh == 0 { qs0 } else { (qs0 >> sh) | (qs1 << (128 - sh)) } }
@@ -237,8 +256,12 @@ fn exec_table<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn) -> Result<(), Trap> 
                 for k in 0..n { sum += if signed { lane(x, wd, k) * lane(y, wd, k) } else { (lane_u(x, wd, k) * lane_u(y, wd, k)) as i64 }; }
                 accx_set(cpu, if signed { sat(sum, 40) } else { usat(sum, 40) });
             } else {
-                let aw = if w == 8 { 20 } else { 40 };
-                for k in 0..n { let prod = if signed { lane(x, wd, k) * lane(y, wd, k) } else { (lane_u(x, wd, k) * lane_u(y, wd, k)) as i64 }; let acc = qacc_get(cpu, wd, k, signed) + prod; qacc_set(cpu, wd, k, if signed { sat(acc, aw) } else { usat(acc, aw) }); }
+                match (w, signed) {
+                    (8, true) => mac_qacc::<8, true>(cpu, x, y),
+                    (8, false) => mac_qacc::<8, false>(cpu, x, y),
+                    (_, true) => mac_qacc::<16, true>(cpu, x, y),
+                    (_, false) => mac_qacc::<16, false>(cpu, x, y),
+                }
             }
             match ldk {
                 LdKind::None => {}
@@ -249,8 +272,8 @@ fn exec_table<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn) -> Result<(), Trap> 
             if qup { let r = src(q!(Qs0), q!(Qs1), cpu.sar_byte); setq!(Qs0, r); }
         }
         Kind::Vsmulas { w, ld: ldq } => {
-            let (x, y) = (q!(Qx), q!(Qy)); let wd = w as u32; let n = 128 / wd; let t = lane(y, wd, o.get(Sel) as u32 % n); let aw = if w == 8 { 20 } else { 40 };
-            for k in 0..n { let acc = qacc_get(cpu, wd, k, true) + lane(x, wd, k) * t; qacc_set(cpu, wd, k, sat(acc, aw)); }
+            let (x, y) = (q!(Qx), q!(Qy)); let wd = w as u32; let n = 128 / wd; let t = lane(y, wd, o.get(Sel) as u32 % n);
+            if w == 8 { mac_scalar_qacc::<8>(cpu, x, t); } else { mac_scalar_qacc::<16>(cpu, x, t); }
             if ldq { let v = ld(cpu, bus, ar!(As), 16)?; setq!(Qu, v); post!(Mode::Incp); }
         }
         Kind::Cmul { store: false } => {
@@ -332,6 +355,8 @@ pub fn pack(w: u32, idx: usize) -> (u8, u8, u8) {
             (PACKED, q(o.get(Qx)) | (q(o.get(Qy)) << 4), 0),
         (Kind::Vmulas { signed: true, w: 8 | 16, accx: true, ld: LdKind::Ip, qup: false }, Some(t)) =>
             (PACKED | (q(o.get(Qu)) << 4) | a, q(o.get(Qx)) | (q(o.get(Qy)) << 4), t),
+        (Kind::Vsmulas { w: 8 | 16, .. }, _) =>
+            (PACKED | (q(o.get(Qu)) << 4) | a, q(o.get(Qx)) | (q(o.get(Qy)) << 4), o.get(Sel) as u8),
         _ => (0, 0, 0),
     }
 }
@@ -369,6 +394,17 @@ fn exec_packed<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn) -> Result<(), Trap>
             }
         }
         Kind::ZeroAccx => cpu.accx = [0; 2],
+        Kind::Vsmulas { w, ld: load } => {
+            let (x, y) = (cpu.qr[q0], cpu.qr[q1]);
+            let scalar = lane(y, w as u32, u32::from(i.t) % (128 / u32::from(w)));
+            if w == 8 { mac_scalar_qacc::<8>(cpu, x, scalar); } else { mac_scalar_qacc::<16>(cpu, x, scalar); }
+            if load {
+                let at = cpu.get_ar(a);
+                let value = ld128(cpu, bus, at)?;
+                cpu.qr[q2] = value;
+                cpu.set_ar(a, at.wrapping_add(16));
+            }
+        }
         _ => unreachable!("pack marks only the kinds handled here"),
     }
     Ok(())
@@ -406,8 +442,9 @@ mod tests {
     const BASE: u32 = 0x3fc9_0000;
     /// Not a multiple of 16: a load aligned into the last partial block runs off the end mid-load.
     const SIZE: usize = 0x1000 - 8;
-    const HOT: [&str; 7] = ["ee.vld.128.ip", "ee.vst.128.ip", "ee.vmulas.s8.accx", "ee.vmulas.s8.accx.ld.ip",
-                            "ee.vmulas.s16.accx", "ee.vmulas.s16.accx.ld.ip", "ee.zero.accx"];
+    const HOT: [&str; 11] = ["ee.vld.128.ip", "ee.vst.128.ip", "ee.vmulas.s8.accx", "ee.vmulas.s8.accx.ld.ip",
+                            "ee.vmulas.s16.accx", "ee.vmulas.s16.accx.ld.ip", "ee.zero.accx",
+                            "ee.vsmulas.s8.qacc", "ee.vsmulas.s16.qacc", "ee.vsmulas.s8.qacc.ld.incp", "ee.vsmulas.s16.qacc.ld.incp"];
 
     /// The same memory without a bulk read, so the packed path takes its per-word fallback.
     struct NoBulk(FlatRam);
@@ -452,8 +489,40 @@ mod tests {
         }
     }
 
-    fn state(c: &Cpu) -> (Vec<u32>, [u128; 8], [u32; 2], u32, u32, u32) {
-        ((0..16u8).map(|n| c.get_ar(n)).collect(), c.qr, c.accx, c.exccause, c.excvaddr, c.pc)
+    type State = (Vec<u32>, [u128; 8], [u32; 2], [u32; 5], [u32; 5], u32, u32, u32);
+    fn state(c: &Cpu) -> State {
+        ((0..16u8).map(|n| c.get_ar(n)).collect(), c.qr, c.accx, c.qacc_l, c.qacc_h, c.exccause, c.excvaddr, c.pc)
+    }
+
+    #[test]
+    fn batched_qacc_matches_scalar_lanes_and_saturation() {
+        let mut random = Rng(0x72f8_1234_9abc_def0);
+        for width in [8, 16] {
+            for signed in [false, true] {
+                for _ in 0..4000 {
+                    let mut expected = Cpu::new(0);
+                    expected.qacc_l = std::array::from_fn(|_| random.u32());
+                    expected.qacc_h = std::array::from_fn(|_| random.u32());
+                    let mut actual = expected.clone();
+                    let (x, y) = (random.q(), random.q());
+                    for lane_index in 0..128 / width {
+                        let product = if signed { lane(x, width, lane_index) * lane(y, width, lane_index) }
+                                      else { (lane_u(x, width, lane_index) * lane_u(y, width, lane_index)) as i64 };
+                        let value = qacc_get(&expected, width, lane_index, signed) + product;
+                        let bits = if width == 8 { 20 } else { 40 };
+                        qacc_set(&mut expected, width, lane_index, if signed { sat(value, bits) } else { usat(value, bits) });
+                    }
+                    match (width, signed) {
+                        (8, true) => mac_qacc::<8, true>(&mut actual, x, y),
+                        (8, false) => mac_qacc::<8, false>(&mut actual, x, y),
+                        (_, true) => mac_qacc::<16, true>(&mut actual, x, y),
+                        (_, false) => mac_qacc::<16, false>(&mut actual, x, y),
+                    }
+                    assert_eq!(actual.qacc_l, expected.qacc_l);
+                    assert_eq!(actual.qacc_h, expected.qacc_h);
+                }
+            }
+        }
     }
 
     fn ram(fill: &[u8]) -> FlatRam { let mut r = FlatRam::new(BASE, SIZE); r.mem.copy_from_slice(fill); r }
@@ -482,6 +551,8 @@ mod tests {
                 cpu.cpenable = if r.next().is_multiple_of(16) { 0 } else { 1 << 3 };
                 for n in 0..16u8 { let v = r.address(); cpu.set_ar(n, v); }
                 for q in cpu.qr.iter_mut() { *q = r.q(); }
+                cpu.qacc_l = std::array::from_fn(|_| r.u32());
+                cpu.qacc_h = std::array::from_fn(|_| r.u32());
                 let acc = r.accx();
                 accx_set(&mut cpu, acc);
                 let fill: Vec<u8> = (0..SIZE).map(|_| r.next() as u8).collect();
