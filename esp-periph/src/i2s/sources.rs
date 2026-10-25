@@ -37,9 +37,16 @@ impl PcmSource {
     /// Routed sources retain the newest two seconds; per-port input accepts up to 65536 frames.
     pub fn push(&mut self, frames: &[[i16; 2]]) -> usize {
         self.tone = None;
-        let n = if self.pins.is_none() { frames.len().min(65536 - self.queue.frames.len()) } else { frames.len() };
+        let n = if self.pins.is_none() { frames.len().min(65536usize.saturating_sub(self.queue.frames.len())) } else { frames.len() };
+        if n == 0 { return 0; }
         self.queue.push(frames[..n].iter().copied());
         n
+    }
+    /// Queue every frame in order for lossless host input; a slower guest increases latency and memory use.
+    pub fn push_buffered(&mut self, frames: &[[i16; 2]]) -> usize {
+        self.tone = None;
+        self.queue.frames.extend(frames.iter().copied());
+        frames.len()
     }
     /// Live input: drops the oldest queued frames so at most `backlog` remain after the push,
     /// bounding latency when the guest reads slower than the host produces.
@@ -141,6 +148,16 @@ pub struct RxSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffered_input_preserves_every_frame_and_order_beyond_bounded_capacity() {
+        let mut source = PcmSource::default();
+        let frames: Vec<_> = (0..70000).map(|i| [(i % 32767) as i16; 2]).collect();
+        assert_eq!(source.push_buffered(&frames), frames.len());
+        assert_eq!(source.push(&[[9; 2]]), 0);
+        assert_eq!(source.queued_frames(), frames.len());
+        for expected in frames { assert_eq!(source.next(16000), expected); }
+        assert_eq!(source.queued_frames(), 0);
+    }
     #[test]
     fn absolute_time_is_lazy_monotonic_and_handles_long_stalls() {
         let mut sources = PcmSources::default();

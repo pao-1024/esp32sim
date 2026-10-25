@@ -2,10 +2,6 @@
 use super::*;
 use crate::web::{frame, json_escape};
 
-/// Queued browser microphone frames kept while the guest keeps up: 0.5 s at 16 kHz, two
-/// maximum-size packets. A larger backlog then is stale audio the guest was not reading.
-const WEB_MICROPHONE_BACKLOG: usize = 8192;
-
 /// `[[r,g,b],…]` for the web protocol.
 fn leds_json(leds: &[[u8; 3]]) -> String {
     leds.iter().map(|c| format!("[{},{},{}]", c[0], c[1], c[2])).collect::<Vec<_>>().join(",")
@@ -126,9 +122,8 @@ impl<S: Soc> Machine<S> {
                     continue;
                 }
                 let samples: Vec<_> = b[2..].as_chunks::<2>().0.iter().map(|v| { let s = i16::from_le_bytes(*v); [s, s] }).collect();
-                // Live input stays bounded while behind too: preserving every old frame would
-                // grow latency until the source rejects new microphone packets altogether.
-                let accepted = self.bus.i2s_input(b[1] as usize).map_or(0, |input| input.push_latest(&samples, WEB_MICROPHONE_BACKLOG));
+                // Keep every host frame in order; lag must be solved by execution speed, not audio loss.
+                let accepted = self.bus.i2s_input(b[1] as usize).map_or(0, |input| input.push_buffered(&samples));
                 if accepted != samples.len() { w.send_text(r#"{"t":"microphone-error","message":"Microphone input overflow or unavailable I2S port"}"#); }
                 continue;
             }

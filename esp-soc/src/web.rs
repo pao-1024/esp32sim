@@ -6,15 +6,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 /// One connected browser: frames are queued and written by a dedicated thread so a slow or
-/// frozen tab can never block the emulator. When the queue is full, new frames are dropped.
-pub struct Client { tx: std::sync::mpsc::SyncSender<Vec<u8>>, pub peer: Option<std::net::SocketAddr> }
+/// frozen tab can never block the emulator. A slow reader increases memory use, not audio loss.
+pub struct Client { tx: std::sync::mpsc::Sender<Vec<u8>>, pub peer: Option<std::net::SocketAddr> }
 impl Client {
     fn send(&self, f: Vec<u8>) -> bool {
-        match self.tx.try_send(f) {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => true,          // drop this frame, keep the client
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false, // writer thread gone: client closed
-        }
+        self.tx.send(f).is_ok()
     }
 }
 
@@ -110,7 +106,7 @@ impl WebServer {
     pub fn push_incoming_bin(&self, d: Vec<u8>) {
         let mut sh = self.shared.lock().unwrap();
         if d.first() == Some(&3) { sh.incoming_bin.retain(|old| old.first() != Some(&3)); }
-        if sh.incoming_bin.len() < 4 { sh.incoming_bin.push_back(d); }
+        if d.first() == Some(&5) || sh.incoming_bin.len() < 4 { sh.incoming_bin.push_back(d); }
     }
     pub fn set_hello(&self, frames: Vec<Vec<u8>>) { self.shared.lock().unwrap().hello = frames; }
     /// Only socket clients replay a late-join snapshot; queued consumers use the live outbox.
@@ -200,7 +196,7 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
     let accept = b64(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()));
     if write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").is_err() { return; }
     let _ = stream.set_nodelay(true);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let hello = {
         let mut sh = shared.lock().unwrap();
         let hello = sh.hello.clone();
@@ -229,7 +225,7 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
             8 => break,
             9 => { if tx.send(frame(10, &data)).is_err() { break; } }
             1 => { shared.lock().unwrap().incoming.push_back(String::from_utf8_lossy(&data).to_string()); }
-            2 => { let mut sh = shared.lock().unwrap(); if sh.incoming_bin.len() < 4 { sh.incoming_bin.push_back(data); } }
+            2 => { let web = WebServer { shared: shared.clone(), port: 0 }; web.push_incoming_bin(data); }
             _ => {}
         }
     }
