@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use crate::device::{Device, WriteEffect};
 use crate::regram::RegRam;
 use emu_core::ClockDomain;
+mod rx;
 
 /// The WS2812 bit of one RMT symbol's durations and levels: 1 when its high time exceeds its
 /// low time. A macro so the RMT engine's per-symbol loop keeps exactly this inline code.
@@ -46,12 +47,21 @@ pub struct Rmt {
     dma_fifo: Option<Box<DmaQueue>>,
     running: u8,
     cpu_per_apb: u8,
+    receive: Option<Box<rx::Receive>>,
 }
 impl Rmt {
-    pub fn new(cpu_hz: u64) -> Self { Rmt { running: 0, dma_fifo: None, cpu_per_apb: u8::try_from(cpu_hz / crate::APB_HZ).expect("CPU clock ratio fits u8"), ch: Default::default(), mem: [0; RMT_MEM_WORDS * 8], int_raw: 0, int_ena: 0, sys_conf: 0, ram: RegRam::new(), done: Vec::new(), tx_count: 0 } }
+    pub fn new(cpu_hz: u64) -> Self { Rmt { running: 0, dma_fifo: None, receive: None, cpu_per_apb: u8::try_from(cpu_hz / crate::APB_HZ).expect("CPU clock ratio fits u8"), ch: Default::default(), mem: [0; RMT_MEM_WORDS * 8], int_raw: 0, int_ena: 0, sys_conf: 0, ram: RegRam::new(), done: Vec::new(), tx_count: 0 } }
+    pub fn rx_active(&self) -> bool { self.receive.as_ref().is_some_and(|rx| rx.active()) }
+    pub fn rx_advance(&mut self, cycle: u64) {
+        if let Some(rx) = &mut self.receive { rx.advance(cycle, self.sys_conf, self.cpu_per_apb as u64 * crate::APB_HZ, &mut self.mem, &mut self.int_raw); }
+    }
+    pub fn rx_input(&mut self, channel: usize, cycle: u64, level: bool) {
+        if let Some(rx) = &mut self.receive { rx.input(channel, cycle, level, (self.sys_conf, self.cpu_per_apb as u64 * crate::APB_HZ), &mut self.mem, &mut self.int_raw); }
+    }
     pub fn is_running(&self) -> bool { self.running != 0 }
     pub fn irq(&self) -> bool { self.int_raw & self.int_ena != 0 }
     pub fn read(&self, off: u32) -> u32 {
+        if let Some(value) = self.receive.as_ref().and_then(|rx| rx.read(off)) { return value; }
         match off {
             // TX_START / MEM_RD_RST / APB_MEM_RST / TX_STOP / AFIFO_RST / CONF_UPDATE are self-clearing command bits: they read as 0
             0x20..=0x2c => { let c = &self.ch[((off - 0x20) / 4) as usize]; c.conf0 & !(1 << 0) & !(1 << 1) & !(1 << 2) & !(1 << 7) & !(1 << 23) & !(1 << 24) }
@@ -66,6 +76,7 @@ impl Rmt {
     }
     pub fn write(&mut self, off: u32, v: u32) {
         match off {
+            0x30..=0x4c | 0xb0..=0xbc => self.receive.get_or_insert_with(Default::default).write(off, v),
             0x0..=0xc => { let n = ((off) / 4) as usize; let c = &mut self.ch[n]; if c.wr < RMT_MEM_WORDS { self.mem[n * RMT_MEM_WORDS + c.wr] = v; c.wr += 1; } }
             0x20..=0x2c => {
                 let n = ((off - 0x20) / 4) as usize;
