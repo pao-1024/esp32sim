@@ -126,11 +126,9 @@ impl<S: Soc> Machine<S> {
                     continue;
                 }
                 let samples: Vec<_> = b[2..].as_chunks::<2>().0.iter().map(|v| { let s = i16::from_le_bytes(*v); [s, s] }).collect();
-                // A live microphone keeps the newest audio: when the guest keeps up but is not reading
-                // (boot, stopped RX), stale frames are dropped instead of new ones. While it lags, audio
-                // queues so it is caught up with the guest rather than cut out of the middle of speech.
-                let backlog = if self.rt.behind > 0.0 { usize::MAX } else { WEB_MICROPHONE_BACKLOG };
-                let accepted = self.bus.i2s_input(b[1] as usize).map_or(0, |input| input.push_latest(&samples, backlog));
+                // Live input stays bounded while behind too: preserving every old frame would
+                // grow latency until the source rejects new microphone packets altogether.
+                let accepted = self.bus.i2s_input(b[1] as usize).map_or(0, |input| input.push_latest(&samples, WEB_MICROPHONE_BACKLOG));
                 if accepted != samples.len() { w.send_text(r#"{"t":"microphone-error","message":"Microphone input overflow or unavailable I2S port"}"#); }
                 continue;
             }
